@@ -7,7 +7,7 @@ from flask import Blueprint, jsonify, request, current_app
 from fc_app.api.data_helper import receive_client_data, receive_coordinator_data, broadcast_data_to_clients, \
     send_data_to_coordinator, send_finished_flag_to_coordinator
 from fc_app.api.status_helper import init, local_calculation, waiting, global_calculation, broadcast_results, \
-    write_output, finalize
+    write_output, finalize, start, finished
 from redis_util import redis_set, redis_get, get_step, set_step
 
 pool = redis.BlockingConnectionPool(host='localhost', port=6379, db=0, queue_class=q.Queue)
@@ -40,42 +40,24 @@ def status():
     available = redis_get('available')
     current_app.logger.info('[STATUS] GET request ' + str(available))
 
-    if get_step() == 'start':
-        current_app.logger.info('[STEP] start')
-        current_app.logger.info('[API] Federated Mean App')
-    elif get_step() == 'init':
-        init()
-        set_step("local_calculation")
-    elif get_step() == 'local_calculation':
-        local_calculation()
-        set_step('waiting')
-        current_app.logger.info('[STEP] waiting')
-    elif get_step() == 'waiting':
-        waiting()
-    elif get_step() == 'global_calculation':
-        # as soon as all data has arrived the global calculation starts
-        current_app.logger.info('[STEP] global_calculation')
-        global_calculation()
-        set_step("broadcast_results")
-    elif get_step() == 'broadcast_results':
-        # as soon as the global result was calculated, the result is broadcasted to the clients
-        current_app.logger.info('[STEP] broadcast_results')
-        broadcast_results()
-        set_step('write_output')
-    elif get_step() == 'write_output':
-        # The global result is written to the output directory
-        current_app.logger.info('[STEP] write_output')
-        write_output()
-        set_step("finalize")
-        current_app.logger.info('[STEP] finalize')
-    elif get_step() == 'finalize':
-        finalize()
-    elif get_step() == 'finished':
-        # All clients and the coordinator set available to False and finished to True and the computation is done
-        current_app.logger.info('[STEP] finished')
-        return jsonify({'available': False, 'finished': True})
+    switcher = {
+        "start": start,
+        "init": init,
+        "local_calculation": local_calculation,
+        "waiting": waiting,
+        "global_calculation": global_calculation,
+        "broadcast_results": broadcast_results,
+        "write_output": write_output,
+        "finalize": finalize,
+        "finished": finished,
+    }
 
-    return jsonify({'available': True if available else False, 'finished': False})
+    if get_step() != "finished":
+        func = switcher.get(get_step(), lambda: "Invalid state")
+        func()
+        return jsonify({'available': True if available else False, 'finished': False})
+    else:
+        return jsonify({'available': False, 'finished': True})
 
 
 @api_bp.route('/data', methods=['GET', 'POST'])
@@ -90,7 +72,7 @@ def data():
         current_app.logger.info('[DATA] POST request')
         if redis_get('is_coordinator'):
             receive_client_data(request.get_json(True))
-        else:
+        if not redis_get('is_coordinator'):
             receive_coordinator_data(request.get_json(True))
         return jsonify(True)
 
@@ -99,11 +81,11 @@ def data():
         if redis_get('is_coordinator'):
             global_result = broadcast_data_to_clients()
             return jsonify({'global_result': global_result})
-        else:
+        if not redis_get('is_coordinator'):
             if get_step() != 'finalize':
                 local_data = send_data_to_coordinator()
                 return jsonify({'data': local_data})
-            else:
+            if get_step() == "finalize":
                 local_finished_flag = send_finished_flag_to_coordinator()
                 return jsonify({'finished': local_finished_flag})
 
